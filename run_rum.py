@@ -115,42 +115,58 @@ def format_monitor_lines(rum_data):
 # ----------------------
 # Telegram sending (HTML parse_mode)
 # ----------------------
-def send_telegram_message_html(monitor_name, lines):
-    """
-    Send the lines wrapped in <pre> so Telegram uses fixed-width
-    Split into chunks if very long.
-    """
+def send_telegram_message(message_text: str):
+    """Send message with retry & chunking. Uses MarkdownV2 and wraps message inside single backticks."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise Exception("Telegram credentials missing")
+        raise Exception("Telegram credentials missing in environment variables")
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    max_chars = 3200  # conservative chunk size
+    # chunk by characters so we don't exceed Telegram limits
+    chunks = [message_text[i:i+max_chars] for i in range(0, len(message_text), max_chars)]
+
+    for chunk in chunks:
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "MarkdownV2"
+        }
+        for attempt in range(3):
+            try:
+                r = requests.post(url, json=payload, timeout=15)
+                r.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                # transient network/telegram issue -> backoff and retry
+                print(f"Telegram send failed (attempt {attempt+1}): {e}")
+                time.sleep(2 ** attempt)
+
+def send_monitor_block(monitor_name: str, rum_data):
+    lines = format_monitor_lines(rum_data)
     divider = "-" * 40
-    monitor_safe = html.escape(_sanitize_code(monitor_name))
+    mn = _sanitize_code(monitor_name)
 
-    # create blocks of lines sized by characters
+    # pack lines into chunks by char length
     max_chars = 3200
     cur = []
     cur_len = 0
 
-    def _send_block(block_lines):
-        body = "\n".join(block_lines)
-        pre = f"<pre>{body}</pre>"
-        text = f"📊 Site24x7 RUM Summary\n\n[{monitor_safe}]\n\n{pre}\n{divider}"
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        r = requests.post(url, json=payload, timeout=15)
-        r.raise_for_status()
-        print("Sent chunk, length:", len(text))
+    def send_chunk(chunk_lines):
+        body = "\n".join(chunk_lines)
+        # wrap entire block inside single backticks (monospaced inline style)
+        msg = f"`📊 Site24x7 RUM Summary\n\n[{mn}]\n\n{body}\n{divider}`"
+        send_telegram_message(msg)
 
     for line in lines:
         add_len = len(line) + 1
         if cur and (cur_len + add_len > max_chars):
-            _send_block(cur)
+            send_chunk(cur)
             cur, cur_len = [], 0
         cur.append(line)
         cur_len += add_len
 
     if cur:
-        _send_block(cur)
+        send_chunk(cur)
 
 # ----------------------
 # Main
