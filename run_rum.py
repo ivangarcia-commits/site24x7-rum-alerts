@@ -1,36 +1,39 @@
-#!/usr/bin/env python3
-import os, json, re, time, html
-from datetime import datetime
+# run_rum.py
+import os
+import json
+import re
+import time
 import requests
+from datetime import datetime
 
-# ----------------------
-# Config (from env)
-# ----------------------
+# ----------------- Config from env (GitHub secrets) -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+ZOHO_TOKEN_URL     = os.getenv("ZOHO_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
 ZOHO_CLIENT_ID     = os.getenv("ZOHO_CLIENT_ID")
 ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
-ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
-ZOHO_TOKEN_URL     = os.getenv("ZOHO_TOKEN_URL", "https://accounts.zoho.com/oauth/v2/token")
 
-# Optional: supply JSON string of monitors as a secret or env var; fallback to defaults
+# RUM monitors mapping (string JSON in secret optional). Defaults to your 3 monitors.
 RUM_MONITORS = json.loads(os.getenv("RUM_MONITORS", json.dumps({
-    "awc7": "509934000004443003",
-    "qm7":  "509934000004443045",
-    "ig7":  "509934000004441003"
+    "AWC7": "509934000004443003",
+    "IG7" : "509934000004441003",
+    "QM7" : "509934000004443045"
 })))
 
-# ----------------------
-# Helpers
-# ----------------------
-def _sanitize_code(text: str) -> str:
+# ----------------- Helpers -----------------
+def _sanitize_backticks(text: str) -> str:
+    """Replace backticks so we can safely wrap the whole line inside single backticks."""
+    if text is None:
+        return ""
     return str(text).replace("`", "'")
 
 def clean_path(path: str) -> str:
-    """Return cleaned path, or empty string to exclude the row."""
+    """Return cleaned path or empty string to exclude."""
     if not isinstance(path, str):
         return ""
-    # Exclude /syn33/*/slots/games/* anywhere
+    # Exclude /syn33/*/slots/games/* entirely
     if re.search(r"/syn33/[^/]+/slots/games/[^/]+", path):
         return ""
     path = re.sub(r"^/asia-ig7/", "", path)
@@ -40,9 +43,11 @@ def clean_path(path: str) -> str:
     path = re.sub(r"/+", "/", path).strip("/")
     return path
 
+# ----------------- Zoho token & Site24x7 fetch -----------------
 def refresh_access_token():
+    """Get Zoho access token using refresh token."""
     if not (ZOHO_REFRESH_TOKEN and ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET):
-        raise Exception("Zoho credentials missing")
+        raise Exception("Zoho credentials missing in environment variables")
     params = {
         "refresh_token": ZOHO_REFRESH_TOKEN,
         "client_id": ZOHO_CLIENT_ID,
@@ -54,70 +59,95 @@ def refresh_access_token():
     return r.json()["access_token"]
 
 def fetch_rum_data(rum_id, token):
+    """
+    Call Site24x7 RUM endpoint and return normalized list of items.
+    The API sometimes returns multiple shapes; normalize to a list.
+    """
     url = f"https://www.site24x7.com/api/rum/web/view/{rum_id}/wt/list/avgRT/H"
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
-    r = requests.get(url, headers=headers, timeout=20)
+    r = requests.get(url, headers=headers, timeout=25)
     r.raise_for_status()
     j = r.json()
-    # Normalize: the API sometimes nests in different shapes
+
+    # Optional debug: write to /tmp (Actions runner has /home/runner/work if you need)
+    try:
+        fname = f"/tmp/rum_debug_{rum_id}.json"
+        with open(fname, "w", encoding="utf-8") as fh:
+            json.dump(j, fh, indent=2)
+    except Exception:
+        pass
+
     if "data" not in j:
         return []
     data_field = j["data"]
     if isinstance(data_field, list):
         return data_field
     if isinstance(data_field, dict):
+        # Most common: 'list' key
         if "list" in data_field and isinstance(data_field["list"], list):
             return data_field["list"]
+        # Otherwise take the first list we find inside the dict
         for v in data_field.values():
             if isinstance(v, list):
                 return v
     return []
 
-# ----------------------
-# Formatting (HTML <pre> monospace)
-# ----------------------
+# ----------------- Formatting -----------------
 def format_monitor_lines(rum_data):
+    """
+    Build aligned table lines (monospace): Game (left), Avg (right), Emoji.
+    Returns list of plain text lines (no markdown wrapping).
+    """
     rows = []
     for item in rum_data or []:
-        raw = item.get("name", "") or ""
-        path = clean_path(raw)
-        if not path or path.startswith("prod/") or path.strip() in {"*", ""}:
+        raw_path = item.get("name", "") or ""
+        path = clean_path(raw_path)
+        if not path:
             continue
+        if path.startswith("prod/") or path.strip() in {"*", ""}:
+            continue
+
         try:
-            avg_s = float(item.get("average_response_time", 0)) / 1000.0
-        except (TypeError, ValueError):
+            avg_ms = float(item.get("average_response_time", 0))
+            avg_s = avg_ms / 1000.0
+        except Exception:
             avg_s = 0.0
+
         emoji = "🚨" if avg_s > 6 else "⚠️" if avg_s > 5 else ""
-        game = _sanitize_code(path)
-        avg_txt = f"{avg_s:.2f} sec"
-        rows.append((game, avg_s, avg_txt, emoji))
+        game = _sanitize_backticks(path)
+        avg_str = f"{avg_s:.2f} sec"
+        rows.append((game, avg_s, avg_str, emoji))
 
     if not rows:
         return ["No data"]
 
-    rows.sort(key=lambda x: x[1], reverse=True)  # highest first
+    # sort by avg desc
+    rows.sort(key=lambda x: x[1], reverse=True)
 
+    # dynamic column widths
     max_game_len = max(len(r[0]) for r in rows)
     game_w = max(20, max_game_len + 2)
-    avg_w = max(len(r[2]) for r in rows)
+    max_avg_len = max(len(r[2]) for r in rows)
+    avg_w = max(8, max_avg_len)
 
-    lines = [f"{'Game'.ljust(game_w)}{'Avg'.rjust(avg_w)}", ""]
-    for game, _, avg_txt, emoji in rows:
-        # Escape text for HTML inside <pre>
-        safe_game = html.escape(game)
-        safe_avg = html.escape(avg_txt)
-        line = f"{safe_game.ljust(game_w)}{safe_avg.rjust(avg_w)}   {emoji}"
+    lines = []
+    # header
+    header = f"{'Game'.ljust(game_w)}{'Avg'.rjust(avg_w)}"
+    lines.append(header)
+    lines.append("")  # blank line after header (we will wrap lines individually)
+
+    for game, _, avg_str, emoji in rows:
+        line = f"{game.ljust(game_w)}{avg_str.rjust(avg_w)}   {emoji}"
         lines.append(line)
         lines.append("")  # spacing between rows
 
     return lines
 
-# ----------------------
-# Telegram sending (HTML parse_mode)
-# ----------------------
-def send_telegram_message(message_text: str):
+# ----------------- Telegram sending -----------------
+def send_telegram_message_safe(message_text: str):
+    """Send to Telegram with retries but do not raise on failure (log instead)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise Exception("Telegram credentials missing")
+        raise Exception("Telegram credentials missing in environment variables")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -125,47 +155,71 @@ def send_telegram_message(message_text: str):
         "text": message_text,
         "parse_mode": "MarkdownV2"
     }
-    r = requests.post(url, json=payload, timeout=15)
-    r.raise_for_status()
+
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code == 200:
+                print("Telegram sent (len=%d)" % len(message_text))
+                return True
+            else:
+                # log the response and try again
+                print(f"Telegram HTTP {r.status_code}: {r.text}")
+        except Exception as e:
+            print("Telegram send exception:", str(e))
+        time.sleep(2 ** attempt)
+    print("Telegram sending failed after retries.")
+    return False
 
 def send_monitor_block(monitor_name: str, rum_data):
-    lines = []
-    for game, avg in rum_data.items():
-        emoji = "🚨" if avg > 6 else "⚠️" if avg > 5 else ""
-        lines.append(f"{_sanitize_code(game)}  {_sanitize_code(f'{avg:.2f} sec')}  {emoji}")
+    """
+    Build message for one monitor:
+    - every visible line is wrapped in single backticks (inline code) so it's monospace.
+    - we ensure no backticks remain inside lines.
+    """
+    lines = format_monitor_lines(rum_data)
+    divider = "-" * 40
 
-    if not lines:
-        lines.append("No data")
+    # Build message lines: header + monitor name + table lines + divider
+    msg_lines = []
+    # header and monitor name (each as inline-code)
+    msg_lines.append(f"`📊 Site24x7 RUM Summary`")
+    msg_lines.append("")  # blank line
+    msg_lines.append(f"`[{_sanitize_backticks(monitor_name)}]`")
+    msg_lines.append("")  # blank line
 
-    # Build final message with single backticks
-    msg = (
-        f"`📊 Site24x7 RUM Summary`\n"
-        f"`[{_sanitize_code(monitor_name)}]`\n\n"
-        + "\n".join(f"`{line}`" for line in lines)
-    )
-    send_telegram_message(msg)
+    # Table lines: wrap each line in its own backtick inline-code.
+    for ln in lines:
+        # ln already sanitized for backticks; ensure it's a simple string
+        safe_ln = _sanitize_backticks(ln)
+        msg_lines.append(f"`{safe_ln}`")
 
-# ----------------------
-# Main
-# ----------------------
+    # divider as inline-code
+    msg_lines.append(f"`{divider}`")
+
+    message_text = "\n".join(msg_lines)
+    send_telegram_message_safe(message_text)
+
+# ----------------- Main -----------------
 def main():
-    print("Start:", datetime.utcnow().isoformat(), "UTC")
+    print("Run start:", datetime.utcnow().isoformat(), "UTC")
     token = refresh_access_token()
     for name, rum_id in RUM_MONITORS.items():
+        print("Processing monitor:", name, rum_id)
         try:
             rum_data = fetch_rum_data(rum_id, token)
-            lines = format_monitor_lines(rum_data)
-            send_telegram_message_html(name, lines)
-            time.sleep(1)  # small delay between monitors
+            send_monitor_block(name, rum_data)
+            # small delay between monitors
+            time.sleep(1)
         except Exception as e:
-            print("Error processing", name, str(e))
-            # best-effort notify
+            print("Error for monitor", name, str(e))
+            # send best-effort error message (wrap inside code to avoid markdown issues)
             try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                msg = f"Error for [{_sanitize_code(name)}]: {html.escape(str(e))}"
-                requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-            except Exception:
-                pass
+                err_msg = f"`📊 Site24x7 RUM Summary`\n`[{_sanitize_backticks(name)}]`\n\n`❌ { _sanitize_backticks(str(e)) }`"
+                send_telegram_message_safe(err_msg)
+            except Exception as e2:
+                print("Failed to send error via Telegram:", e2)
+            continue
 
 if __name__ == "__main__":
     main()
