@@ -30,6 +30,5 @@ jobs:
           ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
           ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
           ZOHO_TOKEN_URL: ${{ secrets.ZOHO_TOKEN_URL }}
-          RUM_MONITORS: ${{ secrets.RUM_MONITORS }}
         run: |
           python run_rum.py
