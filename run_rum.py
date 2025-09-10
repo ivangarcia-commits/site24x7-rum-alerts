@@ -4,7 +4,8 @@ import json
 import re
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import sys
 
 # ----------------- Config from env (GitHub secrets) -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -33,7 +34,6 @@ def clean_path(path: str) -> str:
     """Return cleaned path or empty string to exclude."""
     if not isinstance(path, str):
         return ""
-    # Exclude /syn33/*/slots/games/* entirely
     if re.search(r"/syn33/[^/]+/slots/games/[^/]+", path):
         return ""
     path = re.sub(r"^/asia-ig7/", "", path)
@@ -45,7 +45,6 @@ def clean_path(path: str) -> str:
 
 # ----------------- Zoho token & Site24x7 fetch -----------------
 def refresh_access_token():
-    """Get Zoho access token using refresh token."""
     if not (ZOHO_REFRESH_TOKEN and ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET):
         raise Exception("Zoho credentials missing in environment variables")
     params = {
@@ -59,17 +58,12 @@ def refresh_access_token():
     return r.json()["access_token"]
 
 def fetch_rum_data(rum_id, token):
-    """
-    Call Site24x7 RUM endpoint and return normalized list of items.
-    The API sometimes returns multiple shapes; normalize to a list.
-    """
     url = f"https://www.site24x7.com/api/rum/web/view/{rum_id}/wt/list/avgRT/H"
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
     r = requests.get(url, headers=headers, timeout=25)
     r.raise_for_status()
     j = r.json()
 
-    # Optional debug: write to /tmp (Actions runner has /home/runner/work if you need)
     try:
         fname = f"/tmp/rum_debug_{rum_id}.json"
         with open(fname, "w", encoding="utf-8") as fh:
@@ -83,10 +77,8 @@ def fetch_rum_data(rum_id, token):
     if isinstance(data_field, list):
         return data_field
     if isinstance(data_field, dict):
-        # Most common: 'list' key
         if "list" in data_field and isinstance(data_field["list"], list):
             return data_field["list"]
-        # Otherwise take the first list we find inside the dict
         for v in data_field.values():
             if isinstance(v, list):
                 return v
@@ -94,10 +86,6 @@ def fetch_rum_data(rum_id, token):
 
 # ----------------- Formatting -----------------
 def format_monitor_lines(rum_data):
-    """
-    Build aligned table lines (monospace): Game (left), Avg (right), Emoji.
-    Returns list of plain text lines (no markdown wrapping).
-    """
     rows = []
     for item in rum_data or []:
         raw_path = item.get("name", "") or ""
@@ -121,31 +109,27 @@ def format_monitor_lines(rum_data):
     if not rows:
         return ["No data"]
 
-    # sort by avg desc
     rows.sort(key=lambda x: x[1], reverse=True)
 
-    # dynamic column widths
     max_game_len = max(len(r[0]) for r in rows)
     game_w = max(20, max_game_len + 2)
     max_avg_len = max(len(r[2]) for r in rows)
     avg_w = max(8, max_avg_len)
 
     lines = []
-    # header
     header = f"{'Game'.ljust(game_w)}{'Avg'.rjust(avg_w)}"
     lines.append(header)
-    lines.append("")  # blank line after header (we will wrap lines individually)
+    lines.append("")
 
     for game, _, avg_str, emoji in rows:
         line = f"{game.ljust(game_w)}{avg_str.rjust(avg_w)}   {emoji}"
         lines.append(line)
-        lines.append("")  # spacing between rows
+        lines.append("")
 
     return lines
 
 # ----------------- Telegram sending -----------------
 def send_telegram_message_safe(message_text: str):
-    """Send to Telegram with retries but do not raise on failure (log instead)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise Exception("Telegram credentials missing in environment variables")
 
@@ -163,7 +147,6 @@ def send_telegram_message_safe(message_text: str):
                 print("Telegram sent (len=%d)" % len(message_text))
                 return True
             else:
-                # log the response and try again
                 print(f"Telegram HTTP {r.status_code}: {r.text}")
         except Exception as e:
             print("Telegram send exception:", str(e))
@@ -172,29 +155,19 @@ def send_telegram_message_safe(message_text: str):
     return False
 
 def send_monitor_block(monitor_name: str, rum_data):
-    """
-    Build message for one monitor:
-    - every visible line is wrapped in single backticks (inline code) so it's monospace.
-    - we ensure no backticks remain inside lines.
-    """
     lines = format_monitor_lines(rum_data)
     divider = "-" * 40
 
-    # Build message lines: header + monitor name + table lines + divider
     msg_lines = []
-    # header and monitor name (each as inline-code)
     msg_lines.append(f"`📊 Site24x7 RUM Summary`")
-    msg_lines.append("")  # blank line
+    msg_lines.append("")
     msg_lines.append(f"`[{_sanitize_backticks(monitor_name)}]`")
-    msg_lines.append("")  # blank line
+    msg_lines.append("")
 
-    # Table lines: wrap each line in its own backtick inline-code.
     for ln in lines:
-        # ln already sanitized for backticks; ensure it's a simple string
         safe_ln = _sanitize_backticks(ln)
         msg_lines.append(f"`{safe_ln}`")
 
-    # divider as inline-code
     msg_lines.append(f"`{divider}`")
 
     message_text = "\n".join(msg_lines)
@@ -202,18 +175,25 @@ def send_monitor_block(monitor_name: str, rum_data):
 
 # ----------------- Main -----------------
 def main():
-    print("Run start:", datetime.utcnow().isoformat(), "UTC")
+    # Philippine Time (UTC+8)
+    ph_tz = timezone(timedelta(hours=8))
+    now = datetime.now(ph_tz)
+
+    # Only run at exact hour
+    if now.minute != 0:
+        print(f"Skipping run at {now.strftime('%Y-%m-%d %H:%M:%S')} PH (not top of hour)")
+        sys.exit(0)
+
+    print("Run start:", now.strftime("%Y-%m-%d %H:%M:%S"), "PH")
     token = refresh_access_token()
     for name, rum_id in RUM_MONITORS.items():
         print("Processing monitor:", name, rum_id)
         try:
             rum_data = fetch_rum_data(rum_id, token)
             send_monitor_block(name, rum_data)
-            # small delay between monitors
             time.sleep(1)
         except Exception as e:
             print("Error for monitor", name, str(e))
-            # send best-effort error message (wrap inside code to avoid markdown issues)
             try:
                 err_msg = f"`📊 Site24x7 RUM Summary`\n`[{_sanitize_backticks(name)}]`\n\n`❌ { _sanitize_backticks(str(e)) }`"
                 send_telegram_message_safe(err_msg)
