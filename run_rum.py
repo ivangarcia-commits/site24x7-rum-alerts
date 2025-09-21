@@ -86,6 +86,10 @@ def fetch_rum_data(rum_id, token):
 
 # ----------------- Formatting -----------------
 def format_monitor_lines(rum_data):
+    """
+    Build aligned table lines (monospace): Game (left), Avg (right), Emoji.
+    Only include rows >= 5 seconds.
+    """
     rows = []
     for item in rum_data or []:
         raw_path = item.get("name", "") or ""
@@ -101,16 +105,22 @@ def format_monitor_lines(rum_data):
         except Exception:
             avg_s = 0.0
 
-        emoji = "🚨" if avg_s > 6 else "⚠️" if avg_s > 5 else ""
+        # 🚨 Skip anything below 5s
+        if avg_s < 5.0:
+            continue
+
+        emoji = "🚨" if avg_s > 6 else "⚠️"
         game = _sanitize_backticks(path)
         avg_str = f"{avg_s:.2f} sec"
         rows.append((game, avg_s, avg_str, emoji))
 
     if not rows:
-        return ["No data"]
+        return ["No data ≥ 5 sec"]
 
+    # sort by avg desc
     rows.sort(key=lambda x: x[1], reverse=True)
 
+    # dynamic column widths
     max_game_len = max(len(r[0]) for r in rows)
     game_w = max(20, max_game_len + 2)
     max_avg_len = max(len(r[2]) for r in rows)
@@ -119,7 +129,7 @@ def format_monitor_lines(rum_data):
     lines = []
     header = f"{'Game'.ljust(game_w)}{'Avg'.rjust(avg_w)}"
     lines.append(header)
-    lines.append("")
+    lines.append("")  # blank line
 
     for game, _, avg_str, emoji in rows:
         line = f"{game.ljust(game_w)}{avg_str.rjust(avg_w)}   {emoji}"
